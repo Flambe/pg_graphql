@@ -573,6 +573,8 @@ pub enum FilterOp {
     Equal,
     NotEqual,
     In,
+    Like,
+    ILike,
 }
 
 impl FromStr for FilterOp {
@@ -587,6 +589,8 @@ impl FromStr for FilterOp {
             "gt" => Ok(Self::GreaterThan),
             "gte" => Ok(Self::GreaterThanEqualTo),
             "in" => Ok(Self::In),
+            "like" => Ok(Self::Like),
+            "ilike" => Ok(Self::ILike),
             _ => Err("Invalid filter operation".to_string()),
         }
     }

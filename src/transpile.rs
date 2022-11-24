@@ -659,6 +659,8 @@ impl FilterBuilder {
                     FilterOp::GreaterThan => ">",
                     FilterOp::GreaterThanEqualTo => ">=",
                     FilterOp::In => "= any",
+                    FilterOp::Like => "like",
+                    FilterOp::ILike => "ilike",
                 },
                 val_clause
             );
