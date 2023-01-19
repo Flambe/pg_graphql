@@ -2947,6 +2947,20 @@ impl ___Type for FilterTypeType {
                                 sql_type: None,
                             },
                             __InputValue {
+                                name_: "like".to_string(),
+                                type_: __Type::Scalar(scalar.clone()),
+                                description: None,
+                                default_value: None,
+                                sql_type: None,
+                            },
+                            __InputValue {
+                                name_: "ilike".to_string(),
+                                type_: __Type::Scalar(scalar.clone()),
+                                description: None,
+                                default_value: None,
+                                sql_type: None,
+                            },
+                            __InputValue {
                                 name_: "in".to_string(),
                                 type_: __Type::List(ListType {
                                     type_: Box::new(__Type::NonNull(NonNullType {
@@ -2972,6 +2986,20 @@ impl ___Type for FilterTypeType {
                     _ => scalar_infields.extend(vec![
                         __InputValue {
                             name_: "neq".to_string(),
+                            type_: __Type::Scalar(scalar.clone()),
+                            description: None,
+                            default_value: None,
+                            sql_type: None,
+                        },
+                        __InputValue {
+                            name_: "like".to_string(),
+                            type_: __Type::Scalar(scalar.clone()),
+                            description: None,
+                            default_value: None,
+                            sql_type: None,
+                        },
+                        __InputValue {
+                            name_: "ilike".to_string(),
                             type_: __Type::Scalar(scalar.clone()),
                             description: None,
                             default_value: None,
