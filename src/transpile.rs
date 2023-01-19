@@ -7,6 +7,8 @@ use pgx::*;
 use pgx_contrib_spiext::{checked::*, subtxn::*};
 use serde::ser::{Serialize, SerializeMap, Serializer};
 use std::cmp;
+use std::collections::HashSet;
+use std::sync::Arc;
 
 pub fn quote_ident(ident: &str) -> String {
     unsafe {
@@ -33,6 +35,79 @@ pub fn rand_block_name() -> String {
     )
 }
 
+pub trait MutationEntrypoint<'conn> {
+    fn to_sql_entrypoint(&self, param_context: &mut ParamContext) -> Result<String, String>;
+
+    fn execute(
+        &self,
+        xact: SubTransaction<Box<SpiClient<'conn>>>,
+    ) -> Result<(serde_json::Value, SubTransaction<Box<SpiClient<'conn>>>), String> {
+        let mut param_context = ParamContext { params: vec![] };
+        let sql = &self.to_sql_entrypoint(&mut param_context);
+        let sql = match sql {
+            Ok(sql) => sql,
+            Err(err) => {
+                xact.rollback();
+                return Err(err.to_string());
+            }
+        };
+
+        let (res_q, next_xact) = xact
+            .checked_update(sql, None, Some(param_context.params))
+            .map_err(|err| match err {
+                CaughtError::PostgresError(error) => error.message().to_string(),
+                _ => "Internal Error: Failed to execute transpiled query".to_string(),
+            })?;
+
+        let res: pgx::JsonB = match res_q.first().get_datum::<pgx::JsonB>(1) {
+            Some(dat) => dat,
+            None => {
+                next_xact.rollback();
+                return Err(
+                    "Internal Error: Failed to load result from transpiled query".to_string(),
+                );
+            }
+        };
+
+        Ok((res.0, next_xact))
+    }
+}
+
+pub trait QueryEntrypoint {
+    fn to_sql_entrypoint(&self, param_context: &mut ParamContext) -> Result<String, String>;
+
+    fn execute(&self) -> Result<serde_json::Value, String> {
+        let mut param_context = ParamContext { params: vec![] };
+        let sql = &self.to_sql_entrypoint(&mut param_context);
+        let sql = match sql {
+            Ok(sql) => sql,
+            Err(err) => {
+                return Err(err.to_string());
+            }
+        };
+
+        let spi_result: Option<Result<Option<pgx::JsonB>, CaughtError>> = Spi::connect(|c| {
+            //Create subtransaction
+            let sub_txn_result: Result<Option<pgx::JsonB>, CaughtError> =
+                c.sub_transaction(|xact| {
+                    let (val, _) = xact.checked_select(sql, Some(1), Some(param_context.params))?;
+                    // Get a value from the query
+                    let out_val: Option<pgx::JsonB> = val.first().get_datum::<pgx::JsonB>(1);
+                    Ok(out_val)
+                });
+
+            // Return that value from the closure
+            Ok(Some(sub_txn_result))
+        });
+
+        match spi_result {
+            Some(Ok(Some(jsonb))) => Ok(jsonb.0),
+            Some(Ok(None)) => Ok(serde_json::Value::Null),
+            _ => Err("Internal Error: Failed to execute transpiled query".to_string()),
+        }
+    }
+}
+
 impl Table {
     fn to_selectable_columns_clause(&self) -> String {
         self.columns
@@ -46,7 +121,7 @@ impl Table {
     /// a priamry key tuple clause selects the columns of the primary key as a composite record
     /// that is useful in "has_previous_page" by letting us compare records on a known unique key
     fn to_primary_key_tuple_clause(&self, block_name: &str) -> String {
-        let pkey_cols: Vec<&Column> = self.primary_key_columns();
+        let pkey_cols: Vec<&Arc<Column>> = self.primary_key_columns();
 
         let pkey_frags: Vec<String> = pkey_cols
             .iter()
@@ -109,9 +184,9 @@ impl Table {
         let column = order_elem.column;
         let quoted_col = quote_ident(&column.name);
 
-        let val = &cursor_elem.value;
+        let val = cursor_elem.value;
 
-        let val_clause = param_context.clause_for(val, &column.type_name);
+        let val_clause = param_context.clause_for(&val, &column.type_name)?;
 
         let recurse_clause = self.to_pagination_clause(
             block_name,
@@ -182,8 +257,8 @@ impl Table {
     }
 }
 
-impl InsertBuilder {
-    pub fn to_sql(&self, param_context: &mut ParamContext) -> Result<String, String> {
+impl MutationEntrypoint<'_> for InsertBuilder {
+    fn to_sql_entrypoint(&self, param_context: &mut ParamContext) -> Result<String, String> {
         let quoted_block_name = rand_block_name();
         let quoted_schema = quote_ident(&self.table.schema);
         let quoted_table = quote_ident(&self.table.name);
@@ -198,19 +273,35 @@ impl InsertBuilder {
 
         let select_clause = frags.join(", ");
 
-        let columns: &Vec<Column> = &self.table.columns;
+        // Identify all columns provided in any of `object` rows
+        let referenced_column_names: HashSet<&String> =
+            self.objects.iter().flat_map(|x| x.row.keys()).collect();
+
+        let referenced_columns: Vec<&Arc<Column>> = self
+            .table
+            .columns
+            .iter()
+            .filter(|c| referenced_column_names.contains(&c.name))
+            .collect();
+
+        // Order matters. This must be in the same order as `referenced_columns`
+        let referenced_columns_clause: String = referenced_columns
+            .iter()
+            .map(|c| quote_ident(&c.name))
+            .collect::<Vec<String>>()
+            .join(", ");
 
         let mut values_rows_clause: Vec<String> = vec![];
 
         for row_map in &self.objects {
             let mut working_row = vec![];
-            for column in columns {
+            for column in referenced_columns.iter() {
                 let elem_clause = match row_map.row.get(&column.name) {
                     None => "default".to_string(),
                     Some(elem) => match elem {
                         InsertElemValue::Default => "default".to_string(),
                         InsertElemValue::Value(val) => {
-                            param_context.clause_for(val, &column.type_name)
+                            param_context.clause_for(val, &column.type_name)?
                         }
                     },
                 };
@@ -223,13 +314,10 @@ impl InsertBuilder {
 
         let values_clause = values_rows_clause.join(", ");
 
-        let column_names: Vec<String> = columns.iter().map(|x| quote_ident(&x.name)).collect();
-        let columns_clause: String = column_names.join(", ");
-
         Ok(format!(
             "
         with affected as (
-            insert into {quoted_schema}.{quoted_table}({columns_clause})
+            insert into {quoted_schema}.{quoted_table}({referenced_columns_clause})
             values {values_clause}
             returning {selectable_columns_clause}
         )
@@ -239,40 +327,6 @@ impl InsertBuilder {
             affected as {quoted_block_name};
         "
         ))
-    }
-
-    pub fn execute(
-        &self,
-        xact: SubTransaction<SpiClientWrapper>,
-    ) -> Result<(serde_json::Value, SubTransaction<SpiClientWrapper>), String> {
-        let mut param_context = ParamContext { params: vec![] };
-        let sql = &self.to_sql(&mut param_context);
-        let sql = match sql {
-            Ok(sql) => sql,
-            Err(err) => {
-                xact.rollback();
-                return Err(err.to_string());
-            }
-        };
-
-        let (res_q, next_xact) = xact
-            .checked_update(sql, None, Some(param_context.params))
-            .map_err(|err| match err {
-                CaughtError::PostgresError(error) => error.message().to_string(),
-                _ => "Internal Error: Failed to execute transpiled query".to_string(),
-            })?;
-
-        let res: pgx::JsonB = match res_q.first().get_datum::<pgx::JsonB>(1) {
-            Some(dat) => dat,
-            None => {
-                next_xact.rollback();
-                return Err(
-                    "Internal Error: Failed to load result from transpiled query".to_string(),
-                );
-            }
-        };
-
-        Ok((res.0, next_xact))
     }
 }
 
@@ -352,8 +406,8 @@ impl DeleteSelection {
     }
 }
 
-impl UpdateBuilder {
-    pub fn to_sql(&self, param_context: &mut ParamContext) -> Result<String, String> {
+impl MutationEntrypoint<'_> for UpdateBuilder {
+    fn to_sql_entrypoint(&self, param_context: &mut ParamContext) -> Result<String, String> {
         let quoted_block_name = rand_block_name();
         let quoted_schema = quote_ident(&self.table.schema);
         let quoted_table = quote_ident(&self.table.name);
@@ -378,7 +432,7 @@ impl UpdateBuilder {
                     .find(|x| &x.name == column_name)
                     .expect("Failed to find field in update builder");
 
-                let value_clause = param_context.clause_for(val, &column.type_name);
+                let value_clause = param_context.clause_for(val, &column.type_name)?;
 
                 let set_clause_frag = format!("{quoted_column} = {value_clause}");
                 set_clause_frags.push(set_clause_frag);
@@ -388,9 +442,9 @@ impl UpdateBuilder {
 
         let selectable_columns_clause = self.table.to_selectable_columns_clause();
 
-        let where_clause = self
-            .filter
-            .to_where_clause(&quoted_block_name, param_context);
+        let where_clause =
+            self.filter
+                .to_where_clause(&quoted_block_name, &self.table, param_context)?;
 
         let at_most = self.at_most;
 
@@ -434,44 +488,10 @@ impl UpdateBuilder {
         "
         ))
     }
-
-    pub fn execute(
-        &self,
-        xact: SubTransaction<SpiClientWrapper>,
-    ) -> Result<(serde_json::Value, SubTransaction<SpiClientWrapper>), String> {
-        let mut param_context = ParamContext { params: vec![] };
-        let sql = &self.to_sql(&mut param_context);
-        let sql = match sql {
-            Ok(sql) => sql,
-            Err(err) => {
-                xact.rollback();
-                return Err(err.to_string());
-            }
-        };
-
-        let (res_q, next_xact) = xact
-            .checked_update(sql, None, Some(param_context.params))
-            .map_err(|err| match err {
-                CaughtError::PostgresError(error) => error.message().to_string(),
-                _ => "Internal Error: Failed to execute transpiled query".to_string(),
-            })?;
-
-        let res: pgx::JsonB = match res_q.first().get_datum::<pgx::JsonB>(1) {
-            Some(dat) => dat,
-            None => {
-                next_xact.rollback();
-                return Err(
-                    "Internal Error: Failed to load result from transpiled query".to_string(),
-                );
-            }
-        };
-
-        Ok((res.0, next_xact))
-    }
 }
 
-impl DeleteBuilder {
-    pub fn to_sql(&self, param_context: &mut ParamContext) -> Result<String, String> {
+impl MutationEntrypoint<'_> for DeleteBuilder {
+    fn to_sql_entrypoint(&self, param_context: &mut ParamContext) -> Result<String, String> {
         let quoted_block_name = rand_block_name();
         let quoted_schema = quote_ident(&self.table.schema);
         let quoted_table = quote_ident(&self.table.name);
@@ -483,9 +503,9 @@ impl DeleteBuilder {
             .collect::<Result<Vec<_>, _>>()?;
 
         let select_clause = frags.join(", ");
-        let where_clause = self
-            .filter
-            .to_where_clause(&quoted_block_name, param_context);
+        let where_clause =
+            self.filter
+                .to_where_clause(&quoted_block_name, &self.table, param_context)?;
 
         let selectable_columns_clause = self.table.to_selectable_columns_clause();
 
@@ -530,45 +550,11 @@ impl DeleteBuilder {
         "
         ))
     }
-
-    pub fn execute(
-        &self,
-        xact: SubTransaction<SpiClientWrapper>,
-    ) -> Result<(serde_json::Value, SubTransaction<SpiClientWrapper>), String> {
-        let mut param_context = ParamContext { params: vec![] };
-        let sql = &self.to_sql(&mut param_context);
-        let sql = match sql {
-            Ok(sql) => sql,
-            Err(err) => {
-                xact.rollback();
-                return Err(err.to_string());
-            }
-        };
-
-        let (res_q, next_xact) = xact
-            .checked_update(sql, None, Some(param_context.params))
-            .map_err(|err| match err {
-                CaughtError::PostgresError(error) => error.message().to_string(),
-                _ => "Internal Error: Failed to execute transpiled query".to_string(),
-            })?;
-
-        let res: pgx::JsonB = match res_q.first().get_datum::<pgx::JsonB>(1) {
-            Some(dat) => dat,
-            None => {
-                next_xact.rollback();
-                return Err(
-                    "Internal Error: Failed to load result from transpiled query".to_string(),
-                );
-            }
-        };
-
-        Ok((res.0, next_xact))
-    }
 }
 
 impl OrderByBuilder {
     fn to_order_by_clause(&self, block_name: &str) -> String {
-        let mut frags = vec!["true".to_string()];
+        let mut frags = vec![];
 
         for elem in &self.elems {
             let quoted_column_name = quote_ident(&elem.column.name);
@@ -585,31 +571,35 @@ impl OrderByBuilder {
     }
 }
 
-pub fn json_to_text_datum(val: &serde_json::Value) -> Option<pg_sys::Datum> {
+pub fn json_to_text_datum(val: &serde_json::Value) -> Result<Option<pg_sys::Datum>, String> {
+    use serde_json::Value;
     let null: Option<i32> = None;
     match val {
-        serde_json::Value::Null => null.into_datum(),
-        serde_json::Value::Bool(_) => val.to_string().into_datum(),
-        serde_json::Value::String(x) => x.into_datum(),
-        serde_json::Value::Number(x) => x.to_string().into_datum(),
-        serde_json::Value::Array(xarr) => {
-            let inner_vals: Vec<Option<String>> = xarr
-                .iter()
-                .map(|x| match x {
-                    serde_json::Value::Null => None,
-                    serde_json::Value::Bool(x) => Some(x.to_string()),
-                    serde_json::Value::String(x) => Some(x.to_string()),
-                    serde_json::Value::Number(x) => Some(x.to_string()),
-                    serde_json::Value::Array(_) => panic!("Unexpected array in input value array"),
-                    serde_json::Value::Object(_) => {
-                        panic!("Unexpected object in input value array")
+        Value::Null => Ok(null.into_datum()),
+        Value::Bool(x) => Ok(x.to_string().into_datum()),
+        Value::String(x) => Ok(x.into_datum()),
+        Value::Number(x) => Ok(x.to_string().into_datum()),
+        Value::Array(xarr) => {
+            let mut inner_vals: Vec<Option<String>> = vec![];
+            for elem in xarr {
+                let str_elem = match elem {
+                    Value::Null => None,
+                    Value::Bool(x) => Some(x.to_string()),
+                    Value::String(x) => Some(x.to_string()),
+                    Value::Number(x) => Some(x.to_string()),
+                    Value::Array(_) => {
+                        return Err("Unexpected array in input value array".to_string());
                     }
-                })
-                .collect();
-            inner_vals.into_datum()
+                    Value::Object(_) => {
+                        return Err("Unexpected object in input value array".to_string());
+                    }
+                };
+                inner_vals.push(str_elem);
+            }
+            Ok(inner_vals.into_datum())
         }
         // Should this ever happen? json input is escaped so it would be a string.
-        serde_json::Value::Object(_) => panic!("Unexpected object in input value"),
+        Value::Object(_) => Err("Unexpected object in input value".to_string()),
     }
 }
 
@@ -620,54 +610,106 @@ pub struct ParamContext {
 impl ParamContext {
     // Pushes a parameter into the context and returns a SQL clause to reference it
     //fn clause_for(&mut self, param: (PgOid, Option<pg_sys::Datum>)) -> String {
-    fn clause_for(&mut self, value: &serde_json::Value, type_name: &String) -> String {
+    fn clause_for(
+        &mut self,
+        value: &serde_json::Value,
+        type_name: &String,
+    ) -> Result<String, String> {
         let type_oid = match type_name.ends_with("[]") {
             true => PgOid::from(1009), // text[]
             false => PgOid::from(25),  // text
         };
 
-        let val_datum = json_to_text_datum(value);
+        let val_datum = json_to_text_datum(value)?;
         self.params.push((type_oid, val_datum));
-        format!("(${}::{})", self.params.len(), type_name)
+        Ok(format!("(${}::{})", self.params.len(), type_name))
+    }
+}
+
+impl FilterBuilderElem {
+    fn to_sql(
+        &self,
+        block_name: &str,
+        table: &Table,
+        param_context: &mut ParamContext,
+    ) -> Result<String, String> {
+        match self {
+            Self::Column { column, op, value } => {
+                let frag = match op {
+                    FilterOp::Is => {
+                        format!(
+                            "{block_name}.{} {}",
+                            quote_ident(&column.name),
+                            match value {
+                                serde_json::Value::String(x) => {
+                                    match x.as_str() {
+                                        "NULL" => "is null",
+                                        "NOT_NULL" => "is not null",
+                                        _ => {
+                                            return Err(
+                                                "Error transpiling Is filter value".to_string()
+                                            )
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    return Err(
+                                        "Error transpiling Is filter value type".to_string()
+                                    );
+                                }
+                            }
+                        )
+                    }
+                    _ => {
+                        let cast_type_name = match op {
+                            FilterOp::In => format!("{}[]", column.type_name),
+                            _ => column.type_name.clone(),
+                        };
+
+                        let val_clause = param_context.clause_for(value, &cast_type_name)?;
+
+                        format!(
+                            "{block_name}.{} {} {}",
+                            quote_ident(&column.name),
+                            match op {
+                                FilterOp::Equal => "=",
+                                FilterOp::NotEqual => "<>",
+                                FilterOp::LessThan => "<",
+                                FilterOp::LessThanEqualTo => "<=",
+                                FilterOp::GreaterThan => ">",
+                                FilterOp::GreaterThanEqualTo => ">=",
+                                FilterOp::In => "= any",
+                                FilterOp::Like => "like",
+                                FilterOp::ILike => "ilike",
+                                FilterOp::Is => {
+                                    return Err("Error transpiling Is filter".to_string());
+                                }
+                            },
+                            val_clause
+                        )
+                    }
+                };
+                Ok(frag)
+            }
+            Self::NodeId(node_id) => node_id.to_sql(block_name, table, param_context),
+        }
     }
 }
 
 impl FilterBuilder {
-    fn to_where_clause(&self, block_name: &str, param_context: &mut ParamContext) -> String {
+    fn to_where_clause(
+        &self,
+        block_name: &str,
+        table: &Table,
+        param_context: &mut ParamContext,
+    ) -> Result<String, String> {
         let mut frags = vec!["true".to_string()];
 
         for elem in &self.elems {
-            let column = &elem.column;
-            let op = &elem.op;
-            let value = &elem.value;
-
-            let cast_type_name = match op {
-                FilterOp::In => format!("{}[]", column.type_name),
-                _ => column.type_name.clone(),
-            };
-
-            let val_clause = param_context.clause_for(value, &cast_type_name);
-
-            let frag = format!(
-                "{block_name}.{} {} {}",
-                quote_ident(&column.name),
-                match op {
-                    FilterOp::Equal => "=",
-                    FilterOp::NotEqual => "<>",
-                    FilterOp::LessThan => "<",
-                    FilterOp::LessThanEqualTo => "<=",
-                    FilterOp::GreaterThan => ">",
-                    FilterOp::GreaterThanEqualTo => ">=",
-                    FilterOp::In => "= any",
-                    FilterOp::Like => "like",
-                    FilterOp::ILike => "ilike",
-                },
-                val_clause
-            );
+            let frag = elem.to_sql(block_name, table, param_context)?;
             frags.push(frag);
         }
-
-        frags.join(" and ")
+        Ok(frags.join(" and "))
     }
 }
 
@@ -711,9 +753,10 @@ impl ConnectionBuilder {
         let quoted_schema = quote_ident(&self.table.schema);
         let quoted_table = quote_ident(&self.table.name);
 
-        let where_clause = self
-            .filter
-            .to_where_clause(&quoted_block_name, param_context);
+        let where_clause =
+            self.filter
+                .to_where_clause(&quoted_block_name, &self.table, param_context)?;
+
         let order_by_clause = self.order_by.to_order_by_clause(&quoted_block_name);
         let order_by_clause_reversed = self
             .order_by
@@ -756,7 +799,11 @@ impl ConnectionBuilder {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let limit: i64 = cmp::min(self.first.unwrap_or_else(|| self.last.unwrap_or(30)), 30);
+        let limit: i64 = cmp::min(
+            self.first
+                .unwrap_or_else(|| self.last.unwrap_or(self.max_rows)),
+            self.max_rows,
+        );
 
         let object_clause = frags.join(", ");
 
@@ -858,15 +905,11 @@ impl ConnectionBuilder {
             )"
         ))
     }
+}
 
-    pub fn execute(&self) -> Result<serde_json::Value, String> {
-        let mut param_context = ParamContext { params: vec![] };
-        let sql = &self.to_sql(None, &mut param_context)?;
-
-        let res: pgx::JsonB = Spi::get_one_with_args(sql, param_context.params)
-            .ok_or("Internal Error: Failed to execute transpiled query")?;
-
-        Ok(res.0)
+impl QueryEntrypoint for ConnectionBuilder {
+    fn to_sql_entrypoint(&self, param_context: &mut ParamContext) -> Result<String, String> {
+        self.to_sql(None, param_context)
     }
 }
 
@@ -1078,11 +1121,10 @@ impl NodeBuilder {
             )"
         ))
     }
+}
 
-    pub fn to_query_entrypoint_sql(
-        &self,
-        param_context: &mut ParamContext,
-    ) -> Result<String, String> {
+impl QueryEntrypoint for NodeBuilder {
+    fn to_sql_entrypoint(&self, param_context: &mut ParamContext) -> Result<String, String> {
         let quoted_block_name = rand_block_name();
         let quoted_schema = quote_ident(&self.table.schema);
         let quoted_table = quote_ident(&self.table.name);
@@ -1093,11 +1135,7 @@ impl NodeBuilder {
         }
         let node_id = self.node_id.as_ref().unwrap();
 
-        let node_id_clause = node_id.to_sql(
-            &quoted_block_name,
-            &self.table.primary_key_columns(),
-            param_context,
-        )?;
+        let node_id_clause = node_id.to_sql(&quoted_block_name, &self.table, param_context)?;
 
         Ok(format!(
             "
@@ -1112,29 +1150,25 @@ impl NodeBuilder {
             "
         ))
     }
-
-    pub fn execute(&self) -> Result<serde_json::Value, String> {
-        let mut param_context = ParamContext { params: vec![] };
-        let sql = &self.to_query_entrypoint_sql(&mut param_context)?;
-
-        let res: pgx::JsonB = Spi::get_one_with_args(sql, param_context.params)
-            .unwrap_or(pgx::JsonB(serde_json::Value::Null));
-
-        Ok(res.0)
-    }
 }
 
 impl NodeIdInstance {
     pub fn to_sql(
         &self,
         block_name: &str,
-        pkey_columns: &Vec<&Column>,
+        table: &Table,
         param_context: &mut ParamContext,
     ) -> Result<String, String> {
+        // TODO: abstract this logical check into builder. It is not related to
+        // transpiling and should not be in this module
+        if (&self.schema_name, &self.table_name) != (&table.schema, &table.name) {
+            return Err("nodeId belongs to a different collection".to_string());
+        }
+
         let mut col_val_pairs: Vec<String> = vec![];
-        for (col, val) in pkey_columns.iter().zip(self.values.iter()) {
+        for (col, val) in table.primary_key_columns().iter().zip(self.values.iter()) {
             let column_name = &col.name;
-            let val_clause = param_context.clause_for(val, &col.type_name);
+            let val_clause = param_context.clause_for(val, &col.type_name)?;
             col_val_pairs.push(format!("{block_name}.{column_name} = {val_clause}"))
         }
         Ok(col_val_pairs.join(" and "))

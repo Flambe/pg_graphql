@@ -1,10 +1,12 @@
 use crate::graphql::*;
+use crate::gson;
 use crate::parser_util::*;
 use crate::sql_types::*;
 use graphql_parser::query::*;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct InsertBuilder {
@@ -14,7 +16,7 @@ pub struct InsertBuilder {
     pub objects: Vec<InsertRowBuilder>,
 
     // metadata
-    pub table: Table,
+    pub table: Arc<Table>,
 
     //fields
     pub selections: Vec<InsertSelection>,
@@ -28,7 +30,7 @@ pub struct InsertRowBuilder {
 
 #[derive(Clone, Debug)]
 pub enum InsertElemValue {
-    Default,
+    Default, // Equivalent to gson::Absent
     Value(serde_json::Value),
 }
 
@@ -45,7 +47,7 @@ fn read_argument<'a, T>(
     field: &__Field,
     query_field: &graphql_parser::query::Field<'a, T>,
     variables: &serde_json::Value,
-) -> Result<serde_json::Value, String>
+) -> Result<gson::Value, String>
 where
     T: Text<'a> + Eq + AsRef<str>,
 {
@@ -62,8 +64,8 @@ where
         .next();
 
     let user_json_unvalidated = match user_input {
-        None => serde_json::Value::Null,
-        Some(val) => to_json(val, variables)?,
+        None => gson::Value::Absent,
+        Some(val) => to_gson(val, variables)?,
     };
 
     let user_json_validated = validate_arg_from_type(&input_value.type_(), &user_json_unvalidated)?;
@@ -74,37 +76,24 @@ fn read_argument_at_most<'a, T>(
     field: &__Field,
     query_field: &graphql_parser::query::Field<'a, T>,
     variables: &serde_json::Value,
-) -> Result<i32, String>
+) -> Result<i64, String>
 where
     T: Text<'a> + Eq + AsRef<str>,
 {
-    let at_most: serde_json::Value = read_argument("atMost", field, query_field, variables)
-        .unwrap_or_else(|_| serde_json::json!(1));
-    let at_most: Option<i32> = serde_json::from_value(at_most)
-        .map_err(|_| "Internal Error: failed to parse validated atFirst".to_string())?;
-
+    let at_most: gson::Value = read_argument("atMost", field, query_field, variables)
+        .unwrap_or_else(|_| gson::Value::Number(gson::Number::Integer(1)));
     match at_most {
-        Some(val) => Ok(val),
-        None => Ok(1), // default
+        gson::Value::Number(gson::Number::Integer(x)) => Ok(x),
+        _ => Err("Internal Error: failed to parse validated atFirst".to_string()),
     }
 }
 
-fn read_argument_node_id<'a, T>(
-    field: &__Field,
-    query_field: &graphql_parser::query::Field<'a, T>,
-    variables: &serde_json::Value,
-) -> Result<NodeIdInstance, String>
-where
-    T: Text<'a> + Eq + AsRef<str>,
-{
-    // nodeId is a base64 encoded string of [schema, table, pkey_val1, pkey_val2, ...]
+fn parse_node_id(encoded: gson::Value) -> Result<NodeIdInstance, String> {
     extern crate base64;
     use std::str;
 
-    let node_id_base64_encoded_json_string: serde_json::Value =
-        read_argument("nodeId", field, query_field, variables)?;
-    let node_id_base64_encoded_string: String = match node_id_base64_encoded_json_string {
-        serde_json::Value::String(s) => s,
+    let node_id_base64_encoded_string: String = match encoded {
+        gson::Value::String(s) => s,
         _ => return Err("Invalid value passed to nodeId argument, Error 1".to_string()),
     };
 
@@ -150,6 +139,21 @@ where
     }
 }
 
+fn read_argument_node_id<'a, T>(
+    field: &__Field,
+    query_field: &graphql_parser::query::Field<'a, T>,
+    variables: &serde_json::Value,
+) -> Result<NodeIdInstance, String>
+where
+    T: Text<'a> + Eq + AsRef<str>,
+{
+    // nodeId is a base64 encoded string of [schema, table, pkey_val1, pkey_val2, ...]
+    let node_id_base64_encoded_json_string: gson::Value =
+        read_argument("nodeId", field, query_field, variables)?;
+
+    parse_node_id(node_id_base64_encoded_json_string)
+}
+
 fn read_argument_objects<'a, T>(
     field: &__Field,
     query_field: &graphql_parser::query::Field<'a, T>,
@@ -158,10 +162,8 @@ fn read_argument_objects<'a, T>(
 where
     T: Text<'a> + Eq + AsRef<str>,
 {
-    use serde_json::Value as JsonValue;
-
     // [{"name": "bob", "email": "a@b.com"}, {..}]
-    let validated: serde_json::Value = read_argument("objects", field, query_field, variables)?;
+    let validated: gson::Value = read_argument("objects", field, query_field, variables)?;
 
     // [<Table>OrderBy!]
     let insert_type: InsertInputType =
@@ -176,14 +178,14 @@ where
 
     // validated user input kv map
     match validated {
-        JsonValue::Null => (),
-        JsonValue::Array(x_arr) => {
+        gson::Value::Absent | gson::Value::Null => (),
+        gson::Value::Array(x_arr) => {
             for row in x_arr.iter() {
                 let mut column_elems: HashMap<String, InsertElemValue> = HashMap::new();
 
                 match row {
-                    JsonValue::Null => continue,
-                    JsonValue::Object(obj) => {
+                    gson::Value::Absent | gson::Value::Null => continue,
+                    gson::Value::Object(obj) => {
                         for (column_field_name, col_input_value) in obj.iter() {
                             let column_input_value: &__InputValue =
                                 match insert_type_field_map.get(column_field_name) {
@@ -194,8 +196,10 @@ where
                             match &column_input_value.sql_type {
                                 Some(NodeSQLType::Column(col)) => {
                                     let insert_col_builder = match col_input_value {
-                                        JsonValue::Null => InsertElemValue::Default,
-                                        _ => InsertElemValue::Value(col_input_value.clone()),
+                                        gson::Value::Absent => InsertElemValue::Default,
+                                        _ => InsertElemValue::Value(gson::gson_to_json(
+                                            col_input_value,
+                                        )?),
                                     };
                                     column_elems.insert(col.name.clone(), insert_col_builder);
                                 }
@@ -277,7 +281,7 @@ where
             }
             Ok(InsertBuilder {
                 alias,
-                table: xtype.table.clone(),
+                table: Arc::clone(&xtype.table),
                 objects,
                 selections: builder_fields,
             })
@@ -296,10 +300,10 @@ pub struct UpdateBuilder {
     // args
     pub filter: FilterBuilder,
     pub set: SetBuilder,
-    pub at_most: i32,
+    pub at_most: i64,
 
     // metadata
-    pub table: Table,
+    pub table: Arc<Table>,
 
     //fields
     pub selections: Vec<UpdateSelection>,
@@ -327,9 +331,7 @@ fn read_argument_set<'a, T>(
 where
     T: Text<'a> + Eq + AsRef<str>,
 {
-    use serde_json::Value as JsonValue;
-
-    let validated: serde_json::Value = read_argument("set", field, query_field, variables)?;
+    let validated: gson::Value = read_argument("set", field, query_field, variables)?;
 
     let update_type: UpdateInputType = match field.get_arg("set").unwrap().type_().unmodified_type()
     {
@@ -343,26 +345,24 @@ where
 
     // validated user input kv map
     match validated {
-        JsonValue::Null => (),
-        JsonValue::Object(obj) => {
+        gson::Value::Absent | gson::Value::Null => (),
+        gson::Value::Object(obj) => {
             for (column_field_name, col_input_value) in obj.iter() {
-                match col_input_value {
-                    JsonValue::Null => { // null value sets are ignored. per gql spec
-                    }
-                    _ => {
-                        let column_input_value: &__InputValue =
-                            match update_type_field_map.get(column_field_name) {
-                                Some(input_field) => input_field,
-                                None => return Err("Update re-validation error 3".to_string()),
-                            };
+                // If value is absent, skip it. Nulls are handled as literals
+                if col_input_value == &gson::Value::Absent {
+                    continue;
+                }
+                let column_input_value: &__InputValue =
+                    match update_type_field_map.get(column_field_name) {
+                        Some(input_field) => input_field,
+                        None => return Err("Update re-validation error 3".to_string()),
+                    };
 
-                        match &column_input_value.sql_type {
-                            Some(NodeSQLType::Column(col)) => {
-                                set.insert(col.name.clone(), col_input_value.clone());
-                            }
-                            _ => return Err("Update re-validation error 4".to_string()),
-                        }
+                match &column_input_value.sql_type {
+                    Some(NodeSQLType::Column(col)) => {
+                        set.insert(col.name.clone(), gson::gson_to_json(col_input_value)?);
                     }
+                    _ => return Err("Update re-validation error 4".to_string()),
                 }
             }
         }
@@ -399,7 +399,7 @@ where
 
             let set: SetBuilder = read_argument_set(field, query_field, variables)?;
             let filter: FilterBuilder = read_argument_filter(field, query_field, variables)?;
-            let at_most: i32 = read_argument_at_most(field, query_field, variables)?;
+            let at_most: i64 = read_argument_at_most(field, query_field, variables)?;
 
             let mut builder_fields: Vec<UpdateSelection> = vec![];
 
@@ -438,7 +438,7 @@ where
                 filter,
                 set,
                 at_most,
-                table: xtype.table.clone(),
+                table: Arc::clone(&xtype.table),
                 selections: builder_fields,
             })
         }
@@ -455,10 +455,10 @@ pub struct DeleteBuilder {
 
     // args
     pub filter: FilterBuilder,
-    pub at_most: i32,
+    pub at_most: i64,
 
     // metadata
-    pub table: Table,
+    pub table: Arc<Table>,
 
     //fields
     pub selections: Vec<DeleteSelection>,
@@ -494,7 +494,7 @@ where
             restrict_allowed_arguments(vec!["filter", "atMost"], query_field)?;
 
             let filter: FilterBuilder = read_argument_filter(field, query_field, variables)?;
-            let at_most: i32 = read_argument_at_most(field, query_field, variables)?;
+            let at_most: i64 = read_argument_at_most(field, query_field, variables)?;
 
             let mut builder_fields: Vec<DeleteSelection> = vec![];
 
@@ -532,7 +532,7 @@ where
                 alias,
                 filter,
                 at_most,
-                table: xtype.table.clone(),
+                table: Arc::clone(&xtype.table),
                 selections: builder_fields,
             })
         }
@@ -556,12 +556,14 @@ pub struct ConnectionBuilder {
     pub order_by: OrderByBuilder,
 
     // metadata
-    pub table: Table,
-    pub fkey: Option<ForeignKey>,
+    pub table: Arc<Table>,
+    pub fkey: Option<Arc<ForeignKey>>,
     pub reverse_reference: Option<bool>,
 
     //fields
     pub selections: Vec<ConnectionSelection>,
+
+    pub max_rows: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -573,6 +575,7 @@ pub enum FilterOp {
     Equal,
     NotEqual,
     In,
+    Is,
     Like,
     ILike,
 }
@@ -589,6 +592,7 @@ impl FromStr for FilterOp {
             "gt" => Ok(Self::GreaterThan),
             "gte" => Ok(Self::GreaterThanEqualTo),
             "in" => Ok(Self::In),
+            "is" => Ok(Self::Is),
             "like" => Ok(Self::Like),
             "ilike" => Ok(Self::ILike),
             _ => Err("Invalid filter operation".to_string()),
@@ -597,10 +601,13 @@ impl FromStr for FilterOp {
 }
 
 #[derive(Clone, Debug)]
-pub struct FilterBuilderElem {
-    pub column: Column,
-    pub op: FilterOp,
-    pub value: serde_json::Value, //String, // string repr castable by postgres
+pub enum FilterBuilderElem {
+    Column {
+        column: Arc<Column>,
+        op: FilterOp,
+        value: serde_json::Value, //String, // string repr castable by postgres
+    },
+    NodeId(NodeIdInstance),
 }
 
 #[derive(Clone, Debug)]
@@ -663,7 +670,7 @@ impl OrderDirection {
 impl OrderByBuilderElem {
     fn reverse(&self) -> Self {
         Self {
-            column: self.column.clone(),
+            column: Arc::clone(&self.column),
             direction: self.direction.reverse(),
         }
     }
@@ -720,7 +727,7 @@ impl FromStr for Cursor {
 
 #[derive(Clone, Debug)]
 pub struct OrderByBuilderElem {
-    pub column: Column,
+    pub column: Arc<Column>,
     pub direction: OrderDirection,
 }
 
@@ -774,8 +781,8 @@ pub struct NodeBuilder {
     pub alias: String,
 
     // metadata
-    pub table: Table,
-    pub fkey: Option<ForeignKey>,
+    pub table: Arc<Table>,
+    pub fkey: Option<Arc<ForeignKey>>,
     pub reverse_reference: Option<bool>,
 
     pub selections: Vec<NodeSelection>,
@@ -804,19 +811,19 @@ pub struct NodeIdBuilder {
     pub alias: String,
     pub schema_name: String,
     pub table_name: String,
-    pub columns: Vec<Column>,
+    pub columns: Vec<Arc<Column>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ColumnBuilder {
     pub alias: String,
-    pub column: Column,
+    pub column: Arc<Column>,
 }
 
 #[derive(Clone, Debug)]
 pub struct FunctionBuilder {
     pub alias: String,
-    pub function: Function,
+    pub function: Arc<Function>,
 }
 
 fn restrict_allowed_arguments<'a, T>(
@@ -848,9 +855,7 @@ fn read_argument_filter<'a, T>(
 where
     T: Text<'a> + Eq + AsRef<str>,
 {
-    use serde_json::Value as JsonValue;
-
-    let validated: serde_json::Value = read_argument("filter", field, query_field, variables)?;
+    let validated: gson::Value = read_argument("filter", field, query_field, variables)?;
 
     let filter_type: FilterEntityType =
         match field.get_arg("filter").unwrap().type_().unmodified_type() {
@@ -862,8 +867,8 @@ where
 
     // validated user input kv map
     let kv_map = match validated {
-        JsonValue::Null => return Ok(FilterBuilder { elems: filters }),
-        JsonValue::Object(kv) => kv,
+        gson::Value::Absent | gson::Value::Null => return Ok(FilterBuilder { elems: filters }),
+        gson::Value::Object(kv) => kv,
         _ => return Err("Filter re-validation errror".to_string()),
     };
 
@@ -875,27 +880,35 @@ where
             None => return Err("Filter re-validation error in filter_iv".to_string()),
         };
 
-        let filter_op_to_value_map: &serde_json::Map<String, JsonValue> = match op_to_v {
-            JsonValue::Null => continue,
-            JsonValue::Object(op_to_v_map) => op_to_v_map,
+        let filter_op_to_value_map: &HashMap<String, gson::Value> = match op_to_v {
+            gson::Value::Absent | gson::Value::Null => continue,
+            gson::Value::Object(op_to_v_map) => op_to_v_map,
             _ => return Err("Filter re-validation errror op_to_value map".to_string()),
         };
 
         for (filter_op_str, filter_val) in filter_op_to_value_map.iter() {
             let filter_op = FilterOp::from_str(filter_op_str)?;
 
-            // Treat nulls as not provided
-            if let JsonValue::Null = filter_val {
-                continue;
+            // Skip absent
+            // Technically nulls should be treated as literals. It will always filter out all rows
+            // val <op> null is never true
+            match filter_val {
+                gson::Value::Absent => continue,
+                _ => (),
             }
 
             match &filter_iv.sql_type {
                 Some(NodeSQLType::Column(col)) => {
-                    let filter_builder = FilterBuilderElem {
-                        column: col.clone(),
+                    let filter_builder = FilterBuilderElem::Column {
+                        column: Arc::clone(col),
                         op: filter_op,
-                        value: filter_val.clone(),
+                        value: gson::gson_to_json(filter_val)?,
                     };
+                    filters.push(filter_builder);
+                }
+                Some(NodeSQLType::NodeId(_)) => {
+                    let filter_builder =
+                        FilterBuilderElem::NodeId(parse_node_id(filter_val.clone())?);
                     filters.push(filter_builder);
                 }
                 _ => return Err("Filter type error, attempted filter on non-column".to_string()),
@@ -914,10 +927,8 @@ fn read_argument_order_by<'a, T>(
 where
     T: Text<'a> + Eq + AsRef<str>,
 {
-    use serde_json::Value as JsonValue;
-
     // [{"id": "DescNullsLast"}]
-    let validated: serde_json::Value = read_argument("orderBy", field, query_field, variables)?;
+    let validated: gson::Value = read_argument("orderBy", field, query_field, variables)?;
 
     // [<Table>OrderBy!]
     let order_type: OrderByEntityType =
@@ -932,17 +943,17 @@ where
 
     // validated user input kv map
     match validated {
-        JsonValue::Null => (),
-        JsonValue::Array(x_arr) => {
+        gson::Value::Null | gson::Value::Absent => (),
+        gson::Value::Array(x_arr) => {
             for elem in x_arr.iter() {
                 // {"id", DescNullsLast}
                 match elem {
-                    JsonValue::Null => continue,
-                    JsonValue::Object(obj) => {
+                    gson::Value::Absent | gson::Value::Null => continue,
+                    gson::Value::Object(obj) => {
                         for (column_field_name, order_direction_json) in obj.iter() {
                             let order_direction = match order_direction_json {
-                                JsonValue::Null => continue,
-                                JsonValue::String(x) => OrderDirection::from_str(x)?,
+                                gson::Value::Absent | gson::Value::Null => continue,
+                                gson::Value::String(x) => OrderDirection::from_str(x)?,
                                 _ => return Err("Order re-validation error 6".to_string()),
                             };
                             let column_input_value: &__InputValue =
@@ -954,7 +965,7 @@ where
                             match &column_input_value.sql_type {
                                 Some(NodeSQLType::Column(col)) => {
                                     let order_rec = OrderByBuilderElem {
-                                        column: col.clone(),
+                                        column: Arc::clone(col),
                                         direction: order_direction,
                                     };
                                     orders.push(order_rec);
@@ -976,11 +987,11 @@ where
         .primary_key()
         .ok_or_else(|| "Found table with no primary key".to_string())?;
 
-    for col_attnum in &pkey.column_attnums {
+    for col_name in &pkey.column_names {
         for col in &order_type.table.columns {
-            if &col.attribute_num == col_attnum {
+            if &col.name == col_name {
                 let order_rec = OrderByBuilderElem {
-                    column: col.clone(),
+                    column: Arc::clone(col),
                     direction: OrderDirection::AscNullsLast,
                 };
                 orders.push(order_rec);
@@ -1001,9 +1012,7 @@ fn read_argument_cursor<'a, T>(
 where
     T: Text<'a> + Eq + AsRef<str>,
 {
-    use serde_json::Value as JsonValue;
-
-    let validated: serde_json::Value = read_argument(arg_name, field, query_field, variables)?;
+    let validated: gson::Value = read_argument(arg_name, field, query_field, variables)?;
 
     let _: Scalar = match field.get_arg(arg_name).unwrap().type_().unmodified_type() {
         __Type::Scalar(x) => x,
@@ -1011,8 +1020,14 @@ where
     };
 
     match validated {
-        JsonValue::Null => Ok(None),
-        JsonValue::String(x) => Ok(Some(Cursor::from_str(&x)?)),
+        // Technically null should be treated as a literal here causing no result to return
+        // however:
+        // - there is no reason to ever intentionally pass a null literal to this argument
+        // - alternate implementations treat null as absent for this argument
+        // - passing null appears to be a common mistake
+        // so for backwards compatibility and ease of use, we'll treat null literal as absent
+        gson::Value::Absent | gson::Value::Null => Ok(None),
+        gson::Value::String(x) => Ok(Some(Cursor::from_str(&x)?)),
         _ => Err("Cursor re-validation errror".to_string()),
     }
 }
@@ -1042,14 +1057,32 @@ where
             )?;
 
             // TODO: only one of first/last, before/after provided
+            let first: gson::Value = read_argument("first", field, query_field, variables)?;
+            let first: Option<i64> = match first {
+                gson::Value::Absent | gson::Value::Null => None,
+                gson::Value::Number(gson::Number::Integer(n)) => Some(n),
+                _ => {
+                    return Err("Internal Error: failed to parse validated first".to_string());
+                }
+            };
 
-            let first: serde_json::Value = read_argument("first", field, query_field, variables)?;
-            let first: Option<i64> = serde_json::from_value(first)
-                .map_err(|_| "Internal Error: failed to parse validated first".to_string())?;
+            let last: gson::Value = read_argument("last", field, query_field, variables)?;
+            let last: Option<i64> = match last {
+                gson::Value::Absent | gson::Value::Null => None,
+                gson::Value::Number(gson::Number::Integer(n)) => Some(n),
+                _ => {
+                    return Err("Internal Error: failed to parse validated last".to_string());
+                }
+            };
 
-            let last: serde_json::Value = read_argument("last", field, query_field, variables)?;
-            let last: Option<i64> = serde_json::from_value(last)
-                .map_err(|_| "Internal Error: failed to parse validated last".to_string())?;
+            let max_rows: i64 = xtype
+                .schema
+                .context
+                .schemas
+                .iter()
+                .find(|s| s.oid == xtype.table.schema_oid)
+                .map(|x| x.directives.max_rows)
+                .unwrap_or(30);
 
             let before: Option<Cursor> =
                 read_argument_cursor("before", field, query_field, variables)?;
@@ -1109,7 +1142,7 @@ where
             }
             Ok(ConnectionBuilder {
                 alias,
-                table: xtype.table.clone(),
+                table: Arc::clone(&xtype.table),
                 fkey: xtype.fkey.clone(),
                 reverse_reference: xtype.reverse_reference,
                 first,
@@ -1119,6 +1152,7 @@ where
                 filter,
                 order_by,
                 selections: builder_fields,
+                max_rows: max_rows,
             })
         }
         _ => Err(format!(
@@ -1249,57 +1283,6 @@ where
     }
 }
 
-/*
-pub fn to_node_interface_builder<'a, T>(
-    field: &__Field,
-    query_field: &graphql_parser::query::Field<'a, T>,
-    fragment_definitions: &Vec<FragmentDefinition<'a, T>>,
-    variables: &serde_json::Value,
-) -> Result<NodeBuilder, String>
-where
-    T: Text<'a> + Eq + AsRef<str>,
-{
-    let type_ = field.type_().unmodified_type();
-
-    let type_name = type_
-        .name()
-        .ok_or("Encountered type without name in node builder")?;
-    let field_map = type_.field_map();
-    let alias = alias_or_name(query_field);
-
-    match type_ {
-        __Type::NodeInterface(node_interface) => {
-            restrict_allowed_arguments(vec!["nodeId"], query_field)?;
-
-            // The nodeId argument is only valid on the entrypoint field for Node
-            // relationships to "node" e.g. within edges, do not have any arguments
-            let node_id: NodeIdInstance =
-                read_argument_node_id(table, field, query_field, variables)?;
-
-            let xtype: NodeType = node_interface
-                .possible_types()
-                .iter()
-                .filter_map(|x| match x {
-                    __Type::Node(node_type) => {
-                        match (node_type.table.schema_name, node_type.table.table_name)
-                            == (node_id.schema_name, node_id.table_name)
-                        {
-                            true => Some(node_type),
-                            false => None,
-                        }
-                    }
-                    _ => None,
-                })
-                .next()
-                .unwrap_or(Err(
-                    "Collection referenced by nodeId did not match any known collection",
-                ))?;
-        }
-        _ => Err("can not build query for non-node type".to_string()),
-    }
-}
-*/
-
 pub fn to_node_builder<'a, T>(
     field: &__Field,
     query_field: &graphql_parser::query::Field<'a, T>,
@@ -1410,18 +1393,18 @@ where
                             Some(node_sql_type) => match node_sql_type {
                                 NodeSQLType::Column(col) => NodeSelection::Column(ColumnBuilder {
                                     alias,
-                                    column: col.clone(),
+                                    column: Arc::clone(col),
                                 }),
                                 NodeSQLType::Function(func) => {
                                     NodeSelection::Function(FunctionBuilder {
                                         alias,
-                                        function: func.clone(),
+                                        function: Arc::clone(func),
                                     })
                                 }
                                 NodeSQLType::NodeId(pkey_columns) => {
                                     NodeSelection::NodeId(NodeIdBuilder {
                                         alias,
-                                        columns: pkey_columns.clone(),
+                                        columns: pkey_columns.clone(), // interior is arc
                                         table_name: xtype.table.name.clone(),
                                         schema_name: xtype.table.schema.clone(),
                                     })
@@ -1449,7 +1432,7 @@ where
     Ok(NodeBuilder {
         node_id,
         alias,
-        table: xtype.table.clone(),
+        table: Arc::clone(&xtype.table),
         fkey: xtype.fkey.clone(),
         reverse_reference: xtype.reverse_reference,
         selections: builder_fields,
@@ -1782,13 +1765,17 @@ impl __Schema {
             return Err("can not build query for non-__type type".to_string());
         }
 
-        let name_arg_result: Result<serde_json::Value, String> =
+        let name_arg_result: Result<gson::Value, String> =
             read_argument("name", field, query_field, variables);
         let name_arg: Option<String> = match name_arg_result {
             // This builder (too) is overloaded and the arg is not present in all uses
             Err(_) => None,
-            Ok(name_arg) => serde_json::from_value(name_arg)
-                .map_err(|_| "Internal Error: failed to parse validated name".to_string())?,
+            Ok(name_arg) => match name_arg {
+                gson::Value::String(narg) => Some(narg),
+                _ => {
+                    return Err("Internal Error: failed to parse validated name".to_string());
+                }
+            },
         };
 
         if name_arg.is_some() {

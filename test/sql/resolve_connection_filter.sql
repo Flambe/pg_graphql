@@ -2,14 +2,15 @@ begin;
     create table account(
         id int primary key,
         is_verified bool,
-        name text
+        name text,
+        phone text
     );
 
-    insert into public.account(id, is_verified, name)
+    insert into public.account(id, is_verified, name, phone)
     values
-        (1, true, 'foo'),
-        (2, true, 'bar'),
-        (3, false, 'baz');
+        (1, true, 'foo', '1111111111'),
+        (2, true, 'bar', null),
+        (3, false, 'baz', '33333333333');
 
     savepoint a;
 
@@ -88,7 +89,7 @@ begin;
     select graphql.resolve($${accountCollection(filter: {id: {lt: 2}}) { edges { node { id } } }}$$);
     rollback to savepoint a;
 
-    -- lt - null - should be ignored
+    -- lt - null - treated as literal
     select graphql.resolve($${accountCollection(filter: {id: {lt: null}}) { edges { node { id } } }}$$);
     rollback to savepoint a;
 
@@ -102,6 +103,30 @@ begin;
 
     -- gt
     select graphql.resolve($${accountCollection(filter: {id: {gt: 2}}) { edges { node { id } } }}$$);
+    rollback to savepoint a;
+
+    -- is - is null
+    select graphql.resolve($${accountCollection(filter: {phone: {is: NULL}}) { edges { node { id } } }}$$);
+    rollback to savepoint a;
+
+    -- is - is not null
+    select graphql.resolve($${accountCollection(filter: {phone: {is: NOT_NULL}}) { edges { node { id } } }}$$);
+    rollback to savepoint a;
+
+    -- is - invalid input
+    select graphql.resolve($${accountCollection(filter: {phone: {is: INVALID}}) { edges { node { id } } }}$$);
+    rollback to savepoint a;
+
+    -- is - null literal returns error (this may change but currently seems like the best option and "unbreaking" it is backwards compatible)
+    select graphql.resolve($${accountCollection(filter: {phone: {is: null}}) { edges { node { id } } }}$$);
+    rollback to savepoint a;
+
+    -- variable is - is null
+    select graphql.resolve($$query AAA($nis: FilterIs) { accountCollection(filter: {phone: {is: $nis}}) { edges { node { id } } }}$$, '{"nis": "NULL"}');
+    rollback to savepoint a;
+
+    -- variable is - absent treated as ignored / returns all
+    select graphql.resolve($$query AAA($nis: FilterIs) { accountCollection(filter: {phone: {is: $nis}}) { edges { node { id } } }}$$, '{}');
     rollback to savepoint a;
 
     -- in - int
@@ -128,8 +153,12 @@ begin;
     select graphql.resolve($${accountCollection(filter: {name: {in: []}}) { edges { node { id } } }}$$);
     rollback to savepoint a;
 
-    -- in - null
+    -- in - null literal returns nothing
     select graphql.resolve($${accountCollection(filter: {name: {in: null}}) { edges { node { id } } }}$$);
+    rollback to savepoint a;
+
+    -- variable in - absent treated as ignored / returns all
+    select graphql.resolve($$query AAA($nin: [String!]) { accountCollection(filter: {name: {in: $nin}}) { edges { node { id } } }}$$, '{}');
     rollback to savepoint a;
 
     -- Variable: In, mixed List Int
